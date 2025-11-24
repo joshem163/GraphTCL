@@ -146,6 +146,8 @@ def main():
     parser = argparse.ArgumentParser(description='experiment')
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--dataset', type=str, default='imdb-multi')#MUTAG,PROTEINS,BZR,IMDB-BINARY,COX2,IMDB-MULTI,REDDIT-BINARY,REDDIT-MULTI-5K
+    parser.add_argument('--filtration', type=str, choices=['hks', 'deg', 'close'],
+                        default='deg')
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--gap_pmeter', type=int, default=2)
     parser.add_argument('--head', type=int, default=2)
@@ -165,7 +167,8 @@ def main():
     dataset = load_data(args.dataset)
     print(dataset[0])
 
-    list_hks, thres_hks, label = get_thresh_hks(dataset, 10, 0.1)
+    #list_hks, thres_hks, label = get_thresh_hks(dataset, 10, 0.1)
+    list_hks, thres_hks, label=compute_topological_features(dataset, 10, 0.1,args.filtration)
     list_deg, thres_deg = get_thresh(dataset, 10)
     graph_features = []
     new_data_list = []
