@@ -270,3 +270,46 @@ def apply_Zscore(MP_tensor):
     # Apply z-score normalization per channel
     MP_tensor_z = (MP_tensor - mean) / (std + 1e-8)  # avoid div by zero
     return MP_tensor_z
+
+def compute_degree_centrality(graph):
+    """
+    Degree centrality normalized by (n-1).
+    Returns tensor of shape [num_nodes, 1]
+    """
+    deg = nx.degree_centrality(graph)
+    nodes = list(graph.nodes())
+    deg_vals = [deg[n] for n in nodes]
+    return torch.tensor(deg_vals, dtype=torch.float32).view(-1, 1)
+def compute_closeness_centrality(graph):
+    """
+    Closeness centrality for each node.
+    Returns tensor of shape [num_nodes, 1]
+    """
+    clo = nx.closeness_centrality(graph)
+    nodes = list(graph.nodes())
+    clo_vals = [clo[n] for n in nodes]
+    return torch.tensor(clo_vals, dtype=torch.float32).view(-1, 1)
+
+
+def compute_topological_features(dataset, number_threshold, t_value,filtration_function):
+        graph_list = []
+        label = []
+        for graph_id in range(len(dataset)):
+            graph = to_networkx(dataset[graph_id], to_undirected=True)
+            if filtration_function=='hks':
+                topo_value=compute_hks(graph, t_value)
+            elif filtration_function=='deg':
+                topo_value = compute_degree_centrality(graph)
+            elif filtration_function=='close':
+                topo_value = compute_closeness_centrality(graph)
+            elif filtration_function=='f_ricci':
+                topo_value = compute_forman_ricci(graph)
+            else:
+                print("Filtration function is not valid")
+            graph_list.append(topo_value)
+            label.append(dataset[graph_id].y)
+        thresh = torch.cat(graph_list, dim=0)
+        thresh = process_thresholds(thresh, number_threshold)
+
+        return graph_list, torch.tensor(thresh), label
+
