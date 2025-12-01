@@ -1,112 +1,146 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINConv, global_mean_pool
+from torch_geometric.nn import GINConv, GCNConv, global_mean_pool, global_add_pool
+from ogb.graphproppred.mol_encoder import AtomEncoder
 
 class GINEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, out_dim=128, num_layers=3):
+    def __init__(self, in_dim, num_layers, emb_dim, dropout):
         super(GINEncoder, self).__init__()
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
+        self.dropout = dropout
+        self.out_dim = emb_dim
 
-        # Input layer
-        nn1 = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
-        self.convs.append(GINConv(nn1))
-        self.bns.append(nn.BatchNorm1d(hidden_dim))
+        self.convs.append(GINConv(nn.Sequential(
+            nn.Linear(in_dim, 2 * emb_dim),
+            nn.BatchNorm1d(2 * emb_dim),
+            nn.ReLU(),
+            nn.Linear(2 * emb_dim, emb_dim)
+        )))
+        self.bns.append(nn.BatchNorm1d(emb_dim))
 
-        # Hidden layers
         for _ in range(num_layers - 1):
-            nnk = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
-            self.convs.append(GINConv(nnk))
+            self.convs.append(GINConv(nn.Sequential(
+                nn.Linear(emb_dim, emb_dim), nn.BatchNorm1d(emb_dim), nn.ReLU(), nn.Linear(emb_dim, emb_dim))))
+            self.bns.append(nn.BatchNorm1d(emb_dim))
+
+    def forward(self, x, edge_index, batch, edge_attr=None):
+        x = x.float()
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            x = self.bns[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = global_mean_pool(x, batch)
+        return x
+
+class GCNEncoder(nn.Module):
+    def __init__(self, in_dim, num_layers, emb_dim, dropout):
+        super(GCNEncoder, self).__init__()
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.dropout = dropout
+        hidden_dim = emb_dim
+        self.out_dim = emb_dim
+        self.convs.append(GCNConv(in_dim, hidden_dim))
+        self.bns.append(nn.BatchNorm1d(hidden_dim))
+        for _ in range(num_layers - 2):
+            self.convs.append(GCNConv(hidden_dim, hidden_dim))
             self.bns.append(nn.BatchNorm1d(hidden_dim))
+        self.convs.append(GCNConv(hidden_dim, hidden_dim))
+        self.bns.append(nn.BatchNorm1d(hidden_dim))
+        self.fc_out = nn.Linear(hidden_dim, self.out_dim)
 
-        # Final projection
-        self.fc_out = nn.Linear(hidden_dim, out_dim)
-        self.out_dim = out_dim
-
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, edge_attr=None):
+        x = x.float()
         for conv, bn in zip(self.convs, self.bns):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
-
-        # Graph-level embedding
-        x = global_mean_pool(x, batch)  # [batch_size, hidden_dim]
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = global_add_pool(x, batch)
         return self.fc_out(x)
+
 class MLPEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, out_dim=128, num_layers=2):
+    def __init__(self, in_dim, emb_dim):
         super(MLPEncoder, self).__init__()
-        layers = []
-        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+        self.out_dim = emb_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, emb_dim), nn.ReLU(), nn.BatchNorm1d(emb_dim), nn.Linear(emb_dim, emb_dim))
+    def forward(self, x): return self.mlp(x)
 
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i+1]))
-            if i < len(dims) - 2:
-                layers.append(nn.ReLU())
-                layers.append(nn.BatchNorm1d(dims[i+1]))
-
-        self.mlp = nn.Sequential(*layers)
-        self.out_dim = out_dim
-
-    def forward(self, x):
-        return self.mlp(x)
 class HybridGraphTopoModel(nn.Module):
-    def __init__(self, gin_encoder, topo_encoder, hidden_dim=128, proj_dim=64, num_classes=2):
+    def __init__(self, gnn_encoder, topo_encoder, fusion_module, classifier_head, emb_dim):
         super(HybridGraphTopoModel, self).__init__()
-        self.gin_encoder = gin_encoder
+        self.gnn_encoder = gnn_encoder
         self.topo_encoder = topo_encoder
+        self.fusion_module = fusion_module
+        self.classifier_head = classifier_head
+        hidden_dim = self.fusion_module.out_dim
+        proj_dim = emb_dim // 2
+        self.projection_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.BatchNorm1d(hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, proj_dim), nn.BatchNorm1d(proj_dim))
+    def forward(self, x, edge_index, batch, topo_feats, edge_attr=None, labels=None):
+        g_emb = self.gnn_encoder(x, edge_index, batch, edge_attr=edge_attr)
+        t_emb = self.topo_encoder(topo_feats)
+        fused = self.fusion_module(g_emb, t_emb)
+        logits = self.classifier_head(fused)
+        proj = F.normalize(self.projection_head(fused), dim=-1)
+        return logits, proj, fused, g_emb, t_emb
 
-        self.fusion = nn.Linear(
-            self.gin_encoder.out_dim + self.topo_encoder.out_dim, hidden_dim
-        )
-
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-
+class HybridGraphTopoModelOGB(nn.Module):
+    def __init__(self, gnn_encoder, topo_encoder, fusion_module, classifier_head, emb_dim):
+        super(HybridGraphTopoModel, self).__init__()
+        self.atom_encoder = AtomEncoder(emb_dim)
+        self.gnn_encoder = gnn_encoder
+        self.topo_encoder = topo_encoder
+        self.fusion_module = fusion_module
+        self.classifier_head = classifier_head
+        hidden_dim = self.fusion_module.out_dim
+        proj_dim = emb_dim // 2
         self.projection_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, proj_dim)
+            nn.Linear(hidden_dim, proj_dim),
+            nn.BatchNorm1d(proj_dim)
         )
 
-    def forward(self, x, edge_index, batch, topo_feats):
-        g_emb = self.gin_encoder(x, edge_index, batch)
+    def forward(self, x, edge_index, batch, topo_feats, edge_attr=None, labels=None):
+        x_emb = self.atom_encoder(x.long())
+        g_emb = self.gnn_encoder(x_emb, edge_index, batch, edge_attr=edge_attr)
         t_emb = self.topo_encoder(topo_feats)
-
-        fused = torch.cat([g_emb, t_emb], dim=-1)
-        fused = F.relu(self.fusion(fused))
-
-        logits = self.classifier(fused)
+        fused = self.fusion_module(g_emb, t_emb)
+        logits = self.classifier_head(fused)
         proj = F.normalize(self.projection_head(fused), dim=-1)
+        return logits, proj, fused, g_emb, t_emb
 
-        return logits, proj, fused,g_emb, t_emb
+class GraphWithTopoDataset(Dataset):
+    def __init__(self, graphs, topo_feats, labels):
+        self.graphs = graphs
+        self.topo_feats = topo_feats
+        self.labels = labels
+    def __len__(self): return len(self.graphs)
+    def __getitem__(self, idx): return self.graphs[idx], self.topo_feats[idx], self.labels[idx]
 
-class MLP(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout):
-        super(MLP, self).__init__()
+class MyDataset(InMemoryDataset):
+    def __init__(self, data_list):
+        super().__init__('.')
+        self.data, self.slices = self.collate(data_list)
 
-        self.lins = torch.nn.ModuleList()
-        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
-        self.bns = torch.nn.ModuleList()
-        self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
-        for _ in range(num_layers - 2):
-            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
-        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
+def contrastive_loss(z1, z2, temperature=0.1, eps=1e-5):
+    z1 = F.normalize(z1 + eps, dim=-1)
+    z2 = F.normalize(z2 + eps, dim=-1)
+    sim_matrix = torch.matmul(torch.cat([z1, z2], dim=0), torch.cat([z1, z2], dim=0).t()) / temperature
+    mask = torch.eye(2 * z1.size(0), device=z1.device).bool()
+    sim_matrix = sim_matrix.masked_fill(mask, torch.finfo(sim_matrix.dtype).min)
+    labels = torch.cat([torch.arange(z1.size(0), 2*z1.size(0), device=z1.device), torch.arange(0, z1.size(0), device=z1.device)])
+    return F.cross_entropy(sim_matrix, labels)
 
-        self.dropout = dropout
-
-    def reset_parameters(self):
-        for lin in self.lins:
-            lin.reset_parameters()
-        for bn in self.bns:
-            bn.reset_parameters()
-
-    def forward(self, x):
-        for i, lin in enumerate(self.lins[:-1]):
-            x = lin(x)
-            x = self.bns[i](x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lins[-1](x)
-        return torch.log_softmax(x, dim=-1)
+def collate_graph_topo(batch):
+    graphs, topos, labels = zip(*batch)
+    return Batch.from_data_list(graphs), torch.stack(topos), torch.stack(labels)

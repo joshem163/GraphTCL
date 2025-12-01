@@ -1,260 +1,239 @@
-import networkx as nx
-import numpy as np
-import pandas as pd
-import pickle
-import math
-import pyflagser
-import statistics
-import argparse
-from torch_geometric.utils import degree
+import os
+import sys
+import traceback
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.model_selection import KFold
-from torch.utils.data import DataLoader, TensorDataset
-import torch.nn.functional as F
-from tqdm import tqdm
-import time
-from data_loader import load_data
-from model import *
-from modules import *
-from logger import print_stat,stat
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
-from torch.utils.data import Dataset
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.nn import GINConv, GCNConv, global_mean_pool, global_add_pool
+from torch_geometric.data import Batch, Dataset, InMemoryDataset
+from torch_geometric.datasets import TUDataset
+import torch_geometric.transforms as T
+from torch.cuda.amp import GradScaler, autocast
+import argparse
+import warnings
+import logging
+import numpy as np
+import networkx as nx
+from collections import Counter
+from torch_geometric.utils import degree, to_networkx
 
-class MyDataset(InMemoryDataset):
-    def __init__(self, data_list):
-        super().__init__('.')
-        self.data, self.slices = self.collate(data_list)
-class GraphWithTopoDataset(Dataset):
-    def __init__(self, graphs, topo_feats, labels):
-        self.graphs = graphs
-        self.topo_feats = topo_feats
-        self.labels = labels
+def contrastive_loss(z1, z2, temperature=0.1, eps=1e-5):
+    z1 = F.normalize(z1 + eps, dim=-1)
+    z2 = F.normalize(z2 + eps, dim=-1)
+    sim_matrix = torch.matmul(torch.cat([z1, z2], dim=0), torch.cat([z1, z2], dim=0).t()) / temperature
+    mask = torch.eye(2 * z1.size(0), device=z1.device).bool()
+    sim_matrix = sim_matrix.masked_fill(mask, torch.finfo(sim_matrix.dtype).min)
+    labels = torch.cat([torch.arange(z1.size(0), 2*z1.size(0), device=z1.device), torch.arange(0, z1.size(0), device=z1.device)])
+    return F.cross_entropy(sim_matrix, labels)
 
-    def __len__(self):
-        return len(self.graphs)
+def collate_graph_topo(batch):
+    graphs, topos, labels = zip(*batch)
+    return Batch.from_data_list(graphs), torch.stack(topos), torch.stack(labels)
 
-    def __getitem__(self, idx):
-        return self.graphs[idx], self.topo_feats[idx], self.labels[idx]
-
-# def contrastive_loss(z1, z2, temperature=0.1):
-#     z1 = F.normalize(z1, dim=-1)
-#     z2 = F.normalize(z2, dim=-1)
-#     batch_size, _ = z1.shape
-#     z = torch.cat([z1, z2], dim=0)  # [2B, D]
-#     sim = torch.mm(z, z.t()) / temperature
-#     labels = torch.arange(batch_size, device=z.device)
-#     labels = torch.cat([labels, labels], dim=0)
-#
-#     mask = torch.eye(2*batch_size, device=z.device).bool()
-#     sim = sim.masked_fill(mask, -9e15)
-#
-#     loss = F.cross_entropy(sim, labels)
-#     return loss
-
-def contrastive_loss(z1, z2, temperature=0.1):
-    # Normalize
-    z1 = F.normalize(z1, dim=-1)
-    z2 = F.normalize(z2, dim=-1)
-
-    batch_size = z1.size(0)
-
-    # Cosine similarity matrix
-    sim_matrix = torch.matmul(torch.cat([z1, z2], dim=0),
-                              torch.cat([z1, z2], dim=0).t()) / temperature
-    # Mask self-similarity
-    mask = torch.eye(2 * batch_size, device=z1.device).bool()
-    sim_matrix = sim_matrix.masked_fill(mask, -9e15)
-
-    # Labels: positives are diagonal shifted by batch_size
-    labels = torch.cat([
-        torch.arange(batch_size, 2*batch_size, device=z1.device),
-        torch.arange(0, batch_size, device=z1.device)
-    ])
-    loss = F.cross_entropy(sim_matrix, labels)
-    return loss
-
-from torch_geometric.data import Batch
-import torch.nn.functional as F
-
-def train(model, loader, optimizer, device, alpha=0.1):
+def train(model, loader, optimizer, device, scaler, alpha=0.1):
     model.train()
-    total_loss, total_correct, total_examples = 0, 0, 0
-
-    for batch_graphs, batch_topo, batch_labels in loader:
-        # Batch graphs
-        # batch_graphs = Batch.from_data_list(batch_graphs).to(device)
+    total_correct = 0
+    total_examples = 0
+    
+    for batch_graphs, batch_topo_data, batch_labels in loader:
+        if batch_graphs.num_graphs == 0: continue
+        
         batch_graphs = batch_graphs.to(device)
-
-        # Move topo feats & labels
-        batch_topo = batch_topo.to(device)
         batch_labels = batch_labels.to(device)
 
+        if isinstance(batch_topo_data, tuple):
+            batch_topo = (batch_topo_data[0].to(device), batch_topo_data[1].to(device))
+        else:
+            batch_topo = batch_topo_data.to(device)
+
+        if batch_labels.dim() > 1: 
+            batch_labels = batch_labels.squeeze()
+            
         optimizer.zero_grad()
-        logits, proj, _ = model(batch_graphs.x, batch_graphs.edge_index, batch_graphs.batch, batch_topo)
 
-        # Supervised classification loss
-        cls_loss = F.cross_entropy(logits, batch_labels)
+        with torch.cuda.amp.autocast():
+            logits, _, _, g_emb, t_emb = model(
+                batch_graphs.x, 
+                batch_graphs.edge_index, 
+                batch_graphs.batch, 
+                topo_feats=batch_topo
+            )
+            loss = F.cross_entropy(logits, batch_labels) + alpha * contrastive_loss(g_emb, t_emb)
 
-        # Contrastive loss between GIN and topo embeddings
-        g_emb = model.gin_encoder(batch_graphs.x, batch_graphs.edge_index, batch_graphs.batch)
-        t_emb = model.topo_encoder(batch_topo)
-        con_loss = contrastive_loss(g_emb, t_emb)
-        # print("CLS Loss:", cls_loss.item())
-        # print("Contrastive Loss:", con_loss.item())
+        scaler.scale(loss).backward()
+        
+        scaler.unscale_(optimizer)
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
 
-        loss = cls_loss + alpha * con_loss
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * batch_graphs.num_graphs
-        total_correct += (logits.argmax(dim=-1) == batch_labels).sum().item()
+        preds = logits.argmax(dim=-1)
+        total_correct += (preds == batch_labels).sum().item()
         total_examples += batch_graphs.num_graphs
+        
+    return 0.0, 0.0, total_correct / total_examples if total_examples > 0 else 0
 
-    return total_loss / total_examples, total_correct / total_examples
+
 def evaluate(model, loader, device):
     model.eval()
-    total_correct, total_examples = 0, 0
-    y_true, y_pred = [], []
-
+    total_correct = 0
+    total_examples = 0
+    
     with torch.no_grad():
-        for batch_graphs, batch_topo, batch_labels in loader:
-            # batch_graphs = Batch.from_data_list(batch_graphs).to(device)
+        for batch_graphs, batch_topo_data, batch_labels in loader:
             batch_graphs = batch_graphs.to(device)
-            batch_topo = batch_topo.to(device)
             batch_labels = batch_labels.to(device)
+            
+            if isinstance(batch_topo_data, tuple):
+                batch_topo = (batch_topo_data[0].to(device), batch_topo_data[1].to(device))
+            else:
+                batch_topo = batch_topo_data.to(device)
 
-            logits, _, _ = model(batch_graphs.x, batch_graphs.edge_index, batch_graphs.batch, batch_topo)
+            if batch_labels.dim() > 1: 
+                batch_labels = batch_labels.squeeze()
+                
+            logits, _, _, _, _ = model(
+                batch_graphs.x, 
+                batch_graphs.edge_index, 
+                batch_graphs.batch, 
+                topo_feats=batch_topo
+            )
+            
             preds = logits.argmax(dim=-1)
-
             total_correct += (preds == batch_labels).sum().item()
             total_examples += batch_graphs.num_graphs
+            
+    return total_correct / total_examples if total_examples > 0 else 0, 0.0
 
-            y_true.append(batch_labels.cpu())
-            y_pred.append(preds.cpu())
+def run(args):
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
 
-    acc = total_correct / total_examples
-    return acc, torch.cat(y_true), torch.cat(y_pred)
+    dataset = TUDataset(root=f"./data/{args.dataset}", name=args.dataset, transform=T.ToUndirected())
+    if dataset[0].x is None or dataset[0].x.shape[1] == 0:
+        new_list = []
+        max_degree = 0
+
+        for data in dataset:
+            if data.num_nodes > 0:
+                d = degree(data.edge_index[0], data.num_nodes, dtype=torch.long)
+                max_degree = max(max_degree, d.max().item() if d.numel() > 0 else 0)
+
+        for data in dataset:
+            if data.num_nodes == 0:
+                 data.x = torch.zeros((0, max_degree + 1), dtype=torch.float)
+            else:
+                d = degree(data.edge_index[0], data.num_nodes, dtype=torch.long)
+                d[d > max_degree] = max_degree
+                data.x = F.one_hot(d, num_classes=max_degree + 1).float()
+
+            new_list.append(data)
+        dataset = MyDataset(new_list)
+
+    cache_path = f"./topo_cache/topo_cache_{args.dataset}.pt"
+    if not os.path.exists(cache_path):
+
+       
+        dataset = TUDataset(root='./data', name=args.dataset)
+
+        raw_signal_list, thresholds, _ = compute_topological_features(
+            dataset=dataset, 
+            number_threshold=10, 
+            t_value=0.1, 
+            filtration_function=args.filtration
+        )
+
+        graph_features = []
+        print(f" -> Extracting Betti numbers using {args.filtration} filtration...")
+        
+        for i in tqdm(range(len(dataset)), desc="Topo Extraction"):
+            topo_fe = get_Topo_Fe(dataset[i], raw_signal_list[i], thresholds)
+            graph_features.append(topo_fe.float())
+
+        topo_tensor = torch.stack(graph_features)
+        
+        labels = dataset.y.squeeze()
+
+        save_dict = {
+            'y': labels,
+            'topo_tensor': topo_tensor
+        }
+        
+        torch.save(save_dict, cache_path)
+
+        del dataset, raw_signal_list, graph_features, topo_tensor
+        gc.collect()
+        return
+    cache = torch.load(cache_path)
+    topo_tensor = cache['topo_tensor']
+    topo_tensor = (topo_tensor - topo_tensor.mean(dim=0)) / (topo_tensor.std(dim=0) + 1e-6)
+
+    from sklearn.model_selection import StratifiedKFold
+    skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=42)
+    try: y_all = dataset.y.numpy()
+    except: y_all = [d.y.item() for d in dataset]
+    splits = list(skf.split(torch.zeros(len(dataset)), y_all))
+    train_idx, test_idx = splits[args.fold_id - 1]
+
+    data_train = [dataset[i] for i in train_idx]; data_test = [dataset[i] for i in test_idx]
+    topo_train = topo_tensor[train_idx]; topo_test = topo_tensor[test_idx]
+    y_train = torch.tensor([y_all[i] for i in train_idx]).long(); y_test = torch.tensor([y_all[i] for i in test_idx]).long()
+
+    train_loader = DataLoader(GraphWithTopoDataset(data_train, topo_train, y_train), batch_size=args.batch_size, shuffle=True, collate_fn=collate_graph_topo, num_workers=args.num_workers)
+    test_loader = DataLoader(GraphWithTopoDataset(data_test, topo_test, y_test), batch_size=args.batch_size, shuffle=False, collate_fn=collate_graph_topo, num_workers=args.num_workers)
+
+    if args.model_type.lower() == 'gin':
+        gnn = GINEncoder(dataset[0].x.shape[1], args.num_layer, args.emb_dim, args.dropout)
+    else:
+        gnn = GCNEncoder(dataset[0].x.shape[1], args.num_layer, args.emb_dim, args.dropout)
+    topo = MLPEncoder(topo_tensor.shape[1], args.emb_dim)
+    fuse = ConcatFusion(gnn.out_dim, topo.out_dim, args.emb_dim)
+    head = nn.Linear(fuse.out_dim, num_tasks)
+    model = HybridGraphTopoModel(gnn, topo, fuse, head, args.emb_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    torch.compile()
+    scaler = GradScaler()
+
+    best_test_acc = 0.0
+    for epoch in range(1, args.epochs + 1):
+        _, _, _ = train(model, train_loader, optimizer, device, scaler, alpha=args.alpha)
+        test_acc, _ = evaluate(model, test_loader, device)
+        if test_acc > best_test_acc: best_test_acc = test_acc
+
+    print(f"[Fold {args.fold_id}] Best Acc: {best_test_acc:.4f}", flush=True)
+
+<<<<<<< HEAD
 
 
-def main():
-    parser = argparse.ArgumentParser(description='experiment')
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--dataset', type=str, default='imdb-multi')#MUTAG,PROTEINS,BZR,IMDB-BINARY,COX2,IMDB-MULTI,REDDIT-BINARY,REDDIT-MULTI-5K
-    parser.add_argument('--filtration', type=str, choices=['hks', 'deg', 'close'],
-                        default='deg')
-    parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--gap_pmeter', type=int, default=2)
-    parser.add_argument('--head', type=int, default=2)
-    parser.add_argument('--hidden_channels', type=int, default=64)
-    parser.add_argument('--dropout', type=float, default=0.5)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--runs', type=int, default=10)
-    args = parser.parse_args()
-    print(args)
-    device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
-    #dataset='REDDIT-MULTI-5K'#MUTAG,PROTEINS,BRZ,IMDB-BINARY,COX2,IMDB-MULTI,REDDIT-BINARY,REDDIT-MULTI-5K
-    from sklearn.model_selection import train_test_split
-    print(f"Processing dataset: {args.dataset}")
-
-    # Load features and labels
-    dataset = load_data(args.dataset)
-    print(dataset[0])
-
-    #list_hks, thres_hks, label = get_thresh_hks(dataset, 10, 0.1)
-    list_hks, thres_hks, label=compute_topological_features(dataset, 10, 0.1,args.filtration)
-    list_deg, thres_deg = get_thresh(dataset, 10)
-    graph_features = []
-    new_data_list = []
-    for graph_id in tqdm(range(len(dataset))):
-        topo_fe = get_Topo_Fe(dataset[graph_id], list_hks[graph_id], thres_hks)
-        # Make sure it's a torch tensor
-        topo_fe = torch.tensor(topo_fe, dtype=torch.float)
-        graph_features.append(topo_fe)
-        if args.dataset in ['imdb-binary','imdb-multi']:
-            data=dataset[graph_id]
-            deg = degree(data.edge_index[0], data.num_nodes).view(-1, 1)
-            data.x = deg
-            new_data_list.append(data)
-        #dataset[graph_id]=data
-        #dataset[graph_id].x=torch.eye(dataset[graph_id].num_nodes)
-    topo_tensor = torch.stack(graph_features)
-    if len(new_data_list) !=0:
-        dataset = MyDataset(new_data_list)
-    print(dataset[0])
-
-    y = torch.tensor(label, dtype=torch.long)
-
-    # Convert to PyTorch tensors
-
-    # Extract dataset details
-    num_samples = len(y)
-    num_features1 = len(topo_tensor[0])
-    num_classes = len(np.unique(y))
-
-    # Define input and output dimensions
-    node_feat_dim=dataset[0].x.shape[1]
-    topo_dim=num_features1
-    hidden_dim = args.hidden_channels
-    output_dim = num_classes
-    n_heads = args.head
-    n_layers = args.num_layers
-
-
-    # K-Fold Cross Validation
-    kfold = KFold(n_splits=args.runs, shuffle=True,random_state=42)
-    acc_per_fold = []
-    fold_no = 1
-
-    for train_idx, test_idx in kfold.split(topo_tensor):
-        # Split data
-        X1_train, X1_test = topo_tensor[train_idx], topo_tensor[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-
-        data_train = [dataset[i] for i in train_idx]
-        data_test = [dataset[i] for i in test_idx]
-
-        train_dataset = GraphWithTopoDataset(data_train, X1_train, y_train)
-        test_dataset = GraphWithTopoDataset(data_test, X1_test, y_test)
-
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-
-        # Define encoders
-        gin_encoder = GINEncoder(in_dim=node_feat_dim, hidden_dim=64, out_dim=128)
-        topo_encoder = MLPEncoder(in_dim=topo_dim, hidden_dim=64, out_dim=128)
-
-        # Initialize model, loss function, and optimizer
-        # Model
-        model = HybridGraphTopoModel(gin_encoder, topo_encoder, hidden_dim=128, proj_dim=64, num_classes=num_classes)
-        model = model.to(device)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        train_losses = []
-        train_accuracies = []
-        test_accuracies = []
-
-        # Training loop
-        for epoch in range(1, args.epochs):
-            train_loss, train_acc = train(model, train_loader, optimizer, device, alpha=0.1)
-            val_acc, y_true, y_pred = evaluate(model, test_loader, device)
-            train_losses.append(train_loss)
-            train_accuracies.append(train_acc)
-            test_accuracies.append(val_acc)
-            print(
-                f"Epoch {epoch:03d} | Train Loss {train_loss:.4f} | Train Acc {train_acc:.4f} | Val Acc {val_acc:.4f}")
-        print(f'Score for fold {fold_no}: ')
-        acc = print_stat(train_accuracies, test_accuracies)
-        acc_per_fold.append(acc)
-        fold_no += 1
-    print(acc_per_fold)
-    stat(acc_per_fold, 'accuracy')
+=======
+>>>>>>> 6256c8aed25bb5415e3ad0a0105e009a4212321d
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, required=True)
+    parser.add_argument('--fold_id', type=int, required=True)
+    parser.add_argument('--model_type', type=str, default='gin')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--num_layer', type=int, default=3)
+    parser.add_argument('--emb_dim', type=int, default=128)
+    parser.add_argument('--dropout', type=float, default=0.0)
+    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--device_arg', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--n_splits', type=int, default=10)
+    parser.add_argument('--filtration', type=str, choices=['hks', 'deg', 'close'], default='hks')
+    args = parser.parse_args()
+    load_dataset(args.dataset)
+    try:
+        run(args)
+    except Exception as e:
+        print(f"RUNTIME FAILURE: {e}")
+        traceback.print_exc()
+        sys.exit(1)
