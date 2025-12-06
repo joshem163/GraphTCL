@@ -18,6 +18,9 @@ import numpy as np
 import networkx as nx
 from collections import Counter
 from torch_geometric.utils import degree, to_networkx
+from modules import *
+from model import *
+from data_loader import *
 
 def contrastive_loss(z1, z2, temperature=0.1, eps=1e-5):
     z1 = F.normalize(z1 + eps, dim=-1)
